@@ -1,0 +1,55 @@
+享元模式
+目标
+通过共享对象减少相同/相似对象的创建，优化内存
+ 1. 减少内存中相对对象
+ 2. 减少相同对象创建的开销
+
+享元接口： 对外暴露可以共享的状态
+享元接口实现类：具体享元的实现
+享元工厂： 享元的创建，通过HashMap 进行享元的复用
+
+ex. DXView的复用
+享元接口
+public interface IDXViewFlyWeight{
+    void getViewType();
+    DXRootView getDXView();
+}
+实现
+
+public class DXViewFlyWeight {
+    private final DXRootView dxRootView;
+    public DXViewFlyWeight(DXRootView dxRootView){
+       this.dxRootView = dxRootView;
+    }
+    @Override
+    public int getViewType(){
+       return dxRootView.getViewType();
+    }
+    @Override
+    public DXRootView getDXView(){
+        return this.dxRootView;
+    }
+   
+}
+
+享元工厂
+public class DXViewFlyWeightFactory{
+    public HashMap<int,DXViewFlyWeight> hashMap = new HashMap();
+    public DXRootView getViewByType(int type){
+       if(hashMap.containsKey(type){
+          IDXViewFlyWeight dxViewHolder = hashMap.get(type);
+          return dxViewHolder.dxRootView;
+       }
+
+       /// create DX root view
+        hashMap.put(type, dxViewHolder);
+         return dxViewHolder.dxRootView;
+    }
+
+}
+
+享元模式和池有什么不同？ 
+享元模式在复用的时候，不会从map 中把元素remove 掉，而池设计会remove掉
+比如 RecyclerView.RecycledViewPool 是一个池设计
+而直播间的DX View复用其实是享元模式 （一个DX View 只会在一个地方被使用）
+
