@@ -1,0 +1,207 @@
+责任链模式（Chain）是一种行为模式，也就是将请求（Request）沿着处理者进行发送。 收到请求后，处理者可以处理这个请求，也可以将这个请求发送给下一个处理者 （Interceptor）
+https://github.com/eleree/okhttp-gradle/blob/master/src/main/java/okhttp3/internal/http/RealInterceptorChain.javapackage okhttp3.internal.http;
+接下来拆解 OkHttp的责任链是怎么工作的 
+import java.io.IOException;
+import java.util.List;
+import okhttp3.Connection;
+import okhttp3.HttpUrl;
+import okhttp3.Interceptor;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.internal.connection.StreamAllocation;
+
+/**
+ * A concrete interceptor chain that carries the entire interceptor chain: all application
+ * interceptors, the OkHttp core, all network interceptors, and finally the network caller.
+ */
+public final class RealInterceptorChain implements Interceptor.Chain {
+  /// 所有的处理者组成的数组  
+  /// OkHttp的责任链 并不是让每个Interceptor 实现 setNext 方法 
+  /// 而是在chain中  通过构建数组的时序  确定处理者的顺序
+  private final List<Interceptor> interceptors;
+  //// 这些 其实都是上下文信息
+  private final StreamAllocation streamAllocation;
+  private final HttpCodec httpCodec;
+  private final Connection connection;
+  private final int index;
+  private final Request request;
+  private int calls;
+
+  public RealInterceptorChain(List<Interceptor> interceptors, StreamAllocation streamAllocation,
+      HttpCodec httpCodec, Connection connection, int index, Request request) {
+    this.interceptors = interceptors;
+    this.connection = connection;
+    this.streamAllocation = streamAllocation;
+    this.httpCodec = httpCodec;
+    this.index = index;
+    this.request = request;
+  }
+
+  @Override public Connection connection() {
+    return connection;
+  }
+
+  public StreamAllocation streamAllocation() {
+    return streamAllocation;
+  }
+
+  public HttpCodec httpStream() {
+    return httpCodec;
+  }
+
+  @Override public Request request() {
+    return request;
+  }
+
+  @Override public Response proceed(Request request) throws IOException {
+    return proceed(request, streamAllocation, httpCodec, connection);
+  }
+
+  public Response proceed(Request request, StreamAllocation streamAllocation, HttpCodec httpCodec,
+      Connection connection) throws IOException {
+    if (index >= interceptors.size()) throw new AssertionError();
+
+    calls++;
+
+    // If we already have a stream, confirm that the incoming request will use it.
+    if (this.httpCodec != null && !sameConnection(request.url())) {
+      throw new IllegalStateException("network interceptor " + interceptors.get(index - 1)
+          + " must retain the same host and port");
+    }
+
+    // If we already have a stream, confirm that this is the only call to chain.proceed().
+    if (this.httpCodec != null && calls > 1) {
+      throw new IllegalStateException("network interceptor " + interceptors.get(index - 1)
+          + " must call proceed() exactly once");
+    }
+
+    // Call the next interceptor in the chain.
+    /// 责任链中的next 
+    RealInterceptorChain next = new RealInterceptorChain(
+        interceptors, streamAllocation, httpCodec, connection, index + 1, request);
+    /// 当前的处理者 
+    Interceptor interceptor = interceptors.get(index);
+    /// 当前的处理者处理  Interceptor 也就需要实现  intercept(Interceptor.Chain chain) 就可以
+    /// Interceptor 可以抽象为一个处理者 
+    /// 而 Interceptor.Chain 则是对处理者的一层包装 可以理解为链条的下一节
+    Response response = interceptor.intercept(next);
+
+    // Confirm that the next interceptor made its required call to chain.proceed().
+    if (httpCodec != null && index + 1 < interceptors.size() && next.calls != 1) {
+      throw new IllegalStateException("network interceptor " + interceptor
+          + " must call proceed() exactly once");
+    }
+
+    // Confirm that the intercepted response isn't null.
+    if (response == null) {
+      throw new NullPointerException("interceptor " + interceptor + " returned null");
+    }
+
+    return response;
+  }
+
+  private boolean sameConnection(HttpUrl url) {
+    return url.host().equals(connection.route().address().url().host())
+        && url.port() == connection.route().address().url().port();
+  }
+}
+
+
+
+接下来我们看一个具体的实现 
+/**
+ * Bridges from application code to network code. First it builds a network request from a user
+ * request. Then it proceeds to call the network. Finally it builds a user response from the network
+ * response.
+ */
+public final class BridgeInterceptor implements Interceptor {
+  private final CookieJar cookieJar;
+
+  public BridgeInterceptor(CookieJar cookieJar) {
+    this.cookieJar = cookieJar;
+  }
+
+/// 这里的chain 其实就是下一环
+/// 实现就是一个Interceptor.Chain 
+  @Override public Response intercept(Chain chain) throws IOException {
+    Request userRequest = chain.request();
+    Request.Builder requestBuilder = userRequest.newBuilder();
+
+    RequestBody body = userRequest.body();
+    if (body != null) {
+      MediaType contentType = body.contentType();
+      if (contentType != null) {
+        requestBuilder.header("Content-Type", contentType.toString());
+      }
+
+      long contentLength = body.contentLength();
+      if (contentLength != -1) {
+        requestBuilder.header("Content-Length", Long.toString(contentLength));
+        requestBuilder.removeHeader("Transfer-Encoding");
+      } else {
+        requestBuilder.header("Transfer-Encoding", "chunked");
+        requestBuilder.removeHeader("Content-Length");
+      }
+    }
+
+    if (userRequest.header("Host") == null) {
+      requestBuilder.header("Host", hostHeader(userRequest.url(), false));
+    }
+
+    if (userRequest.header("Connection") == null) {
+      requestBuilder.header("Connection", "Keep-Alive");
+    }
+
+    // If we add an "Accept-Encoding: gzip" header field we're responsible for also decompressing
+    // the transfer stream.
+    boolean transparentGzip = false;
+    if (userRequest.header("Accept-Encoding") == null) {
+      transparentGzip = true;
+      requestBuilder.header("Accept-Encoding", "gzip");
+    }
+
+    List<Cookie> cookies = cookieJar.loadForRequest(userRequest.url());
+    if (!cookies.isEmpty()) {
+      requestBuilder.header("Cookie", cookieHeader(cookies));
+    }
+
+    if (userRequest.header("User-Agent") == null) {
+      requestBuilder.header("User-Agent", Version.userAgent());
+    }
+
+    /// 这个就是交给下一个处理者处理 
+    Response networkResponse = chain.proceed(requestBuilder.build());
+
+    HttpHeaders.receiveHeaders(cookieJar, userRequest.url(), networkResponse.headers());
+
+    Response.Builder responseBuilder = networkResponse.newBuilder()
+        .request(userRequest);
+
+    if (transparentGzip
+        && "gzip".equalsIgnoreCase(networkResponse.header("Content-Encoding"))
+        && HttpHeaders.hasBody(networkResponse)) {
+      GzipSource responseBody = new GzipSource(networkResponse.body().source());
+      Headers strippedHeaders = networkResponse.headers().newBuilder()
+          .removeAll("Content-Encoding")
+          .removeAll("Content-Length")
+          .build();
+      responseBuilder.headers(strippedHeaders);
+      responseBuilder.body(new RealResponseBody(strippedHeaders, Okio.buffer(responseBody)));
+    }
+
+    return responseBuilder.build();
+  }
+
+  /** Returns a 'Cookie' HTTP request header with all cookies, like {@code a=b; c=d}. */
+  private String cookieHeader(List<Cookie> cookies) {
+    StringBuilder cookieHeader = new StringBuilder();
+    for (int i = 0, size = cookies.size(); i < size; i++) {
+      if (i > 0) {
+        cookieHeader.append("; ");
+      }
+      Cookie cookie = cookies.get(i);
+      cookieHeader.append(cookie.name()).append('=').append(cookie.value());
+    }
+    return cookieHeader.toString();
+  }
+}
